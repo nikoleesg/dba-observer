@@ -14,5 +14,7 @@
 
 ACL SETUSER dba-observer reset on ><PASSWORD> resetkeys resetchannels -@all +ping +info +config|get +acl|users +acl|getuser
 
-# Equivalent aclfile / redis.conf line (password as its SHA-256, # prefix):
-# user dba-observer on #<SHA256_OF_PASSWORD> resetchannels -@all +ping +info +config|get +acl|users +acl|getuser
+# Equivalent aclfile / redis.conf line (password as its SHA-256, # prefix).
+# It starts with `reset`, like the command above, so a user loaded from the
+# file gets the same flags (incl. sanitize-payload) as one created live:
+# user dba-observer reset on #<SHA256_OF_PASSWORD> resetkeys resetchannels -@all +ping +info +config|get +acl|users +acl|getuser
