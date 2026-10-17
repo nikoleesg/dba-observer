@@ -1,0 +1,107 @@
+# The approved tool surface and policy for dba-observer.
+#
+# This file is the contract. tests/test_catalog.py fails if docker/tools.yaml
+# defines a tool that is not listed here, or misses one that is. The adapter
+# serves get_capabilities and get_policy from this file.
+#
+# backend: toolbox = a mysql-sql / postgres-sql statement in docker/tools.yaml
+#          adapter = served by this package, reached through a Toolbox http tool
+# phase:   requirements phase (0 foundation, 1 monitoring, 2 inspection, 3 diagnostics)
+
+server: dba-observer
+tier: observer          # read-only; Phase 4 administration is a separate server (dba-admin)
+
+targets:
+  - id: mysql
+    engine: mysql
+    host_env: MYSQL_HOST
+    port_env: MYSQL_PORT
+    default_port: 3306
+  - id: postgresql
+    engine: postgresql
+    host_env: PG_HOST
+    port_env: PG_PORT
+    default_port: 5432
+  - id: redis
+    engine: redis
+    host_env: REDIS_HOST
+    port_env: REDIS_PORT
+    default_port: 6379
+
+limits:
+  statement_timeout_seconds: 5      # MySQL queryTimeout; PG statement_timeout
+  lock_timeout_seconds: 1           # PG lock_timeout
+  redis_socket_timeout_seconds: 2
+  adapter_max_concurrency: 4        # concurrent adapter calls; extra calls get status "busy"
+  max_rows: 500                     # hard cap on any list tool's limit parameter
+  default_rows: 25
+  sql_text_max_chars: 300           # session/statement text is normalised and truncated
+  db_connection_caps:
+    mysql: 5                        # MAX_USER_CONNECTIONS on dba_observer
+    postgresql: 6                   # CONNECTION LIMIT on dba_observer (toolbox pool 3 + adapter 2 + 1 spare)
+
+guarantees:
+  - No tool accepts SQL, a Redis command, or a shell command from the caller.
+  - No tool reads application table rows or Redis key values.
+  - No tool returns password hashes or credentials.
+  - Session and statement text is normalised (literals replaced by ?) and truncated.
+  - This server has no mutating tool; administration is Phase 4 (dba-admin), behind operator approval.
+
+tools:
+  # --- Phase 0: foundation (adapter) ---
+  - {name: list_targets,      engine: any, phase: 0, backend: adapter}
+  - {name: get_capabilities,  engine: any, phase: 0, backend: adapter}
+  - {name: tool_health,       engine: any, phase: 0, backend: adapter}
+  - {name: get_policy,        engine: any, phase: 0, backend: adapter}
+  - {name: get_audit_status,  engine: any, phase: 0, backend: adapter}
+
+  # --- Phase 1: monitoring ---
+  - {name: mysql_health,             engine: mysql, phase: 1, backend: toolbox}
+  - {name: mysql_connections,        engine: mysql, phase: 1, backend: toolbox}
+  - {name: mysql_status,             engine: mysql, phase: 1, backend: toolbox}
+  - {name: mysql_database_sizes,     engine: mysql, phase: 1, backend: toolbox}
+  - {name: mysql_replication_status, engine: mysql, phase: 1, backend: toolbox}
+  - {name: pg_health,                engine: postgresql, phase: 1, backend: toolbox}
+  - {name: pg_connections,           engine: postgresql, phase: 1, backend: toolbox}
+  - {name: pg_database_sizes,        engine: postgresql, phase: 1, backend: toolbox}
+  - {name: pg_transaction_stats,     engine: postgresql, phase: 1, backend: toolbox}
+  - {name: pg_replication_status,    engine: postgresql, phase: 1, backend: toolbox}
+  - {name: redis_health,             engine: redis, phase: 1, backend: adapter}
+  - {name: redis_memory,             engine: redis, phase: 1, backend: adapter}
+  - {name: redis_clients,            engine: redis, phase: 1, backend: adapter}
+  - {name: redis_keyspace_stats,     engine: redis, phase: 1, backend: adapter}
+  - {name: redis_persistence,        engine: redis, phase: 1, backend: adapter}
+  - {name: redis_replication_status, engine: redis, phase: 1, backend: adapter}
+
+  # --- Phase 2: schema, configuration and security inspection ---
+  - {name: mysql_list_databases,  engine: mysql, phase: 2, backend: toolbox}
+  - {name: mysql_list_tables,     engine: mysql, phase: 2, backend: toolbox}
+  - {name: mysql_describe_table,  engine: mysql, phase: 2, backend: toolbox}
+  - {name: mysql_list_indexes,    engine: mysql, phase: 2, backend: toolbox}
+  - {name: mysql_configuration,   engine: mysql, phase: 2, backend: toolbox}
+  - {name: mysql_list_users,      engine: mysql, phase: 2, backend: toolbox}
+  - {name: mysql_user_grants,     engine: mysql, phase: 2, backend: toolbox}
+  - {name: pg_list_databases,     engine: postgresql, phase: 2, backend: toolbox}
+  - {name: pg_configuration,      engine: postgresql, phase: 2, backend: toolbox}
+  - {name: pg_list_roles,         engine: postgresql, phase: 2, backend: toolbox}
+  - {name: pg_list_schemas,       engine: postgresql, phase: 2, backend: adapter}
+  - {name: pg_list_tables,        engine: postgresql, phase: 2, backend: adapter}
+  - {name: pg_describe_table,     engine: postgresql, phase: 2, backend: adapter}
+  - {name: pg_list_indexes,       engine: postgresql, phase: 2, backend: adapter}
+  - {name: pg_role_privileges,    engine: postgresql, phase: 2, backend: adapter}
+  - {name: redis_configuration,             engine: redis, phase: 2, backend: adapter}
+  - {name: redis_acl_users,                 engine: redis, phase: 2, backend: adapter}
+  - {name: redis_acl_permissions,           engine: redis, phase: 2, backend: adapter}
+  - {name: redis_keyspace_overview,         engine: redis, phase: 2, backend: adapter}
+  - {name: redis_persistence_configuration, engine: redis, phase: 2, backend: adapter}
+
+  # --- Phase 3 (subset): diagnostics ---
+  - {name: mysql_active_sessions,      engine: mysql, phase: 3, backend: toolbox}
+  - {name: mysql_lock_waits,           engine: mysql, phase: 3, backend: toolbox}
+  - {name: mysql_slow_query_summary,   engine: mysql, phase: 3, backend: toolbox}
+  - {name: mysql_table_io_stats,       engine: mysql, phase: 3, backend: toolbox}
+  - {name: mysql_innodb_metrics,       engine: mysql, phase: 3, backend: toolbox}
+  - {name: mysql_table_fragmentation,  engine: mysql, phase: 3, backend: toolbox}
+  - {name: pg_active_sessions,         engine: postgresql, phase: 3, backend: toolbox}
+  - {name: pg_blocking_sessions,       engine: postgresql, phase: 3, backend: toolbox}
+  - {name: pg_long_transactions,       engine: postgresql, phase: 3, backend: toolbox}

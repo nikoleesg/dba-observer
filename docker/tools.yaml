@@ -1,0 +1,940 @@
+# dba-observer — Google MCP Toolbox configuration (Toolbox v1.14.0).
+#
+# READ-ONLY OBSERVER TIER. Every tool here is a fixed statement written in this
+# file (mysql-sql / postgres-sql) or a fixed adapter route (http). There is no
+# execute-sql kind, no prebuilt kind, and no caller-supplied statement. The
+# entrypoint refuses to start if any other `type:` appears in this file.
+#
+# Parameters are bound values (? / $n), never spliced into SQL text: there are
+# no templateParameters. Optional filters bind once through a derived table
+# `p`, so one parameter can be compared more than once.
+#
+# Contract: src/dba_observer/catalog.yaml. tests/test_catalog.py keeps the two
+# in step.
+
+# =============================================================================
+# Sources
+# =============================================================================
+kind: source
+name: mysql
+type: mysql
+host: ${MYSQL_HOST}
+port: ${MYSQL_PORT:3306}
+user: ${MYSQL_USER}
+password: ${MYSQL_PASSWORD}
+queryTimeout: 5s
+queryParams:
+  tls: ${MYSQL_TLS:preferred}
+---
+kind: source
+name: postgresql
+type: postgres
+host: ${PG_HOST}
+port: ${PG_PORT:5432}
+user: ${PG_USER}
+password: ${PG_PASSWORD}
+database: ${PG_HOME_DATABASE}
+connectTimeout: 5
+queryParams:
+  sslmode: ${PG_SSLMODE:require}
+  application_name: dba-observer
+  pool_max_conns: "3"
+  options: "-c statement_timeout=5000 -c lock_timeout=1000 -c default_transaction_read_only=on"
+---
+kind: source
+name: adapter
+type: http
+baseUrl: ${ADAPTER_URL:http://dba-observer-adapter:8080}
+timeout: 15s
+# The adapter sits on a private Docker network, which Toolbox's SSRF guard blocks
+# by default. Allow exactly that subnet, nothing wider.
+allowedIpRanges:
+  - ${ADAPTER_CIDR:172.30.99.0/29}
+
+# =============================================================================
+# Phase 0 — foundation (adapter)
+# =============================================================================
+---
+kind: tool
+name: list_targets
+type: http
+source: adapter
+method: GET
+path: /v1/tools/list_targets
+description: List the database targets this server observes (MySQL, PostgreSQL, Redis), their engine, address and whether each is configured. No credentials are returned. Start here.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: get_capabilities
+type: http
+source: adapter
+method: GET
+path: /v1/tools/get_capabilities
+description: List every tool on this server with its engine, requirements phase, backend and permission tier (all tools are read-only observer tier), and whether its target is configured.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: tool_health
+type: http
+source: adapter
+method: GET
+path: /v1/tools/tool_health
+description: Report this server's own readiness separately from database health. Components (adapter, audit, Toolbox) and each database (Redis PING and PostgreSQL SELECT 1 with the observer credentials; MySQL TCP reachability) report ok, unavailable, not_configured or permission_denied. For MySQL credential health call mysql_health.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: get_policy
+type: http
+source: adapter
+method: GET
+path: /v1/tools/get_policy
+description: Show the effective limits (timeouts, row caps, concurrency, connection caps), the safety guarantees, and the approval policy. This server has no mutating tools.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: get_audit_status
+type: http
+source: adapter
+method: GET
+path: /v1/tools/get_audit_status
+description: Report whether invocation auditing is operating (adapter audit lines, Toolbox JSON logs) and what is not covered. No audit content is returned.
+annotations: {readOnlyHint: true, idempotentHint: true}
+
+# =============================================================================
+# Phase 1 — MySQL monitoring
+# =============================================================================
+---
+kind: tool
+name: mysql_health
+type: mysql-sql
+source: mysql
+description: MySQL connectivity and identity check with the observer credential. Returns version, distribution, uptime, read_only/super_read_only state and server time.
+statement: |
+  SELECT @@version AS version, @@version_comment AS distribution,
+         CAST((SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Uptime') AS UNSIGNED) AS uptime_seconds,
+         @@read_only = 1 AS read_only, @@super_read_only = 1 AS super_read_only,
+         NOW() AS server_time, @@system_time_zone AS system_time_zone, 'ok' AS status
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_connections
+type: mysql-sql
+source: mysql
+description: MySQL connection pressure. Connected and running threads against max_connections, utilization percent, peak usage, aborted and refused connections, and the 20 accounts holding the most connections.
+statement: |
+  SELECT @@max_connections AS max_connections,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Threads_connected' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS threads_connected,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Threads_running' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS threads_running,
+         ROUND(100 * MAX(CASE WHEN s.VARIABLE_NAME = 'Threads_connected' THEN s.VARIABLE_VALUE END) / @@max_connections, 1) AS utilization_pct,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Max_used_connections' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS max_used_connections,
+         MAX(CASE WHEN s.VARIABLE_NAME = 'Max_used_connections_time' THEN s.VARIABLE_VALUE END) AS max_used_connections_time,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Connection_errors_max_connections' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS refused_max_connections,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Aborted_connects' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS aborted_connects,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Aborted_clients' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS aborted_clients,
+         (SELECT GROUP_CONCAT(CONCAT(a.USER, '=', a.n) ORDER BY a.n DESC SEPARATOR ', ')
+            FROM (SELECT USER, SUM(CURRENT_CONNECTIONS) AS n FROM performance_schema.accounts
+                  WHERE USER IS NOT NULL GROUP BY USER ORDER BY n DESC LIMIT 20) a) AS connections_by_user
+  FROM performance_schema.global_status s
+  WHERE s.VARIABLE_NAME IN ('Threads_connected', 'Threads_running', 'Max_used_connections', 'Max_used_connections_time',
+                            'Connection_errors_max_connections', 'Aborted_connects', 'Aborted_clients')
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_status
+type: mysql-sql
+source: mysql
+description: Allowlisted MySQL server counters (cumulative since start) covering throughput, slow queries, temporary tables, full scans, table cache, row locks and traffic. Compare two calls to get rates.
+statement: |
+  SELECT VARIABLE_NAME AS name, VARIABLE_VALUE AS value
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME IN ('Uptime', 'Questions', 'Queries', 'Com_select', 'Com_insert', 'Com_update', 'Com_delete',
+                          'Com_commit', 'Com_rollback', 'Slow_queries', 'Threads_connected', 'Threads_running',
+                          'Threads_created', 'Threads_cached', 'Created_tmp_tables', 'Created_tmp_disk_tables',
+                          'Select_full_join', 'Select_scan', 'Sort_merge_passes', 'Table_locks_waited',
+                          'Table_open_cache_hits', 'Table_open_cache_misses', 'Opened_tables', 'Open_tables',
+                          'Bytes_received', 'Bytes_sent', 'Innodb_row_lock_waits', 'Innodb_row_lock_time_avg',
+                          'Handler_read_rnd_next', 'Max_used_connections')
+  ORDER BY VARIABLE_NAME
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_database_sizes
+type: mysql-sql
+source: mysql
+description: Approximate storage per MySQL database (data, index and free bytes, table count), largest first. Figures come from information_schema statistics, which MySQL caches, so they are estimates.
+statement: |
+  SELECT s.SCHEMA_NAME AS database_name, COUNT(t.TABLE_NAME) AS tables,
+         CAST(COALESCE(SUM(t.DATA_LENGTH), 0) AS UNSIGNED) AS data_bytes,
+         CAST(COALESCE(SUM(t.INDEX_LENGTH), 0) AS UNSIGNED) AS index_bytes,
+         CAST(COALESCE(SUM(t.DATA_FREE), 0) AS UNSIGNED) AS free_bytes,
+         CAST(COALESCE(SUM(t.DATA_LENGTH + t.INDEX_LENGTH), 0) AS UNSIGNED) AS total_bytes,
+         s.SCHEMA_NAME IN ('mysql', 'sys', 'performance_schema', 'information_schema') AS is_system
+  FROM information_schema.SCHEMATA s
+  LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = s.SCHEMA_NAME
+  GROUP BY s.SCHEMA_NAME
+  ORDER BY total_bytes DESC
+  LIMIT ?
+parameters:
+  - {name: limit, type: integer, description: "Max databases to return (1-500).", default: 50, minValue: 1, maxValue: 500}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_replication_status
+type: mysql-sql
+source: mysql
+description: MySQL replication role and health. replication_role is replica, source or not_configured, and not_configured is a normal state, not a failure. For replicas, returns per-channel receiver/applier state and the last error number and time.
+statement: |
+  SELECT @@server_id AS server_id, @@log_bin = 1 AS binary_logging, @@gtid_mode AS gtid_mode,
+         CASE WHEN (SELECT COUNT(*) FROM performance_schema.replication_connection_configuration) > 0 THEN 'replica'
+              WHEN (SELECT COUNT(*) FROM performance_schema.threads WHERE PROCESSLIST_COMMAND IN ('Binlog Dump', 'Binlog Dump GTID')) > 0 THEN 'source'
+              ELSE 'not_configured' END AS replication_role,
+         (SELECT COUNT(*) FROM performance_schema.threads WHERE PROCESSLIST_COMMAND IN ('Binlog Dump', 'Binlog Dump GTID')) AS connected_replicas,
+         (SELECT GROUP_CONCAT(CONCAT_WS(' ', CONCAT('channel=', IF(c.CHANNEL_NAME = '', '(default)', c.CHANNEL_NAME)),
+                                         CONCAT('receiver=', c.SERVICE_STATE), CONCAT('applier=', COALESCE(a.SERVICE_STATE, '?')),
+                                         CONCAT('last_error=', c.LAST_ERROR_NUMBER), CONCAT('last_error_at=', c.LAST_ERROR_TIMESTAMP),
+                                         CONCAT('last_heartbeat=', c.LAST_HEARTBEAT_TIMESTAMP)) SEPARATOR '; ')
+            FROM performance_schema.replication_connection_status c
+            LEFT JOIN performance_schema.replication_applier_status a ON a.CHANNEL_NAME = c.CHANNEL_NAME) AS channels
+annotations: {readOnlyHint: true, idempotentHint: true}
+
+# =============================================================================
+# Phase 1 — PostgreSQL monitoring
+# =============================================================================
+---
+kind: tool
+name: pg_health
+type: postgres-sql
+source: postgresql
+description: PostgreSQL connectivity and identity check with the observer credential. Returns version, start time, uptime, recovery (standby) state and max_connections.
+statement: |
+  SELECT current_setting('server_version') AS version, version() AS version_detail,
+         pg_postmaster_start_time() AS started_at,
+         extract(epoch FROM now() - pg_postmaster_start_time())::bigint AS uptime_seconds,
+         pg_is_in_recovery() AS in_recovery, current_setting('max_connections')::int AS max_connections,
+         now() AS server_time, 'ok' AS status
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_connections
+type: postgres-sql
+source: postgresql
+description: PostgreSQL connection pressure. Client connections by state (active, idle, idle in transaction) against max_connections, utilization percent, and the 20 busiest database/user pairs.
+statement: |
+  WITH a AS (SELECT state, datname, usename FROM pg_stat_activity WHERE backend_type = 'client backend')
+  SELECT current_setting('max_connections')::int AS max_connections,
+         current_setting('superuser_reserved_connections')::int AS superuser_reserved,
+         (SELECT count(*) FROM a) AS client_connections,
+         (SELECT count(*) FROM a WHERE state = 'active') AS active,
+         (SELECT count(*) FROM a WHERE state = 'idle') AS idle,
+         (SELECT count(*) FROM a WHERE state LIKE 'idle in transaction%') AS idle_in_transaction,
+         round(100.0 * (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend')
+               / current_setting('max_connections')::int, 1) AS utilization_pct,
+         (SELECT json_agg(json_build_object('database', datname, 'user', usename, 'connections', n) ORDER BY n DESC)
+            FROM (SELECT datname, usename, count(*) AS n FROM a GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20) g) AS by_database_user
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_database_sizes
+type: postgres-sql
+source: postgresql
+description: Size of every connectable PostgreSQL database (bytes and human-readable), with owner and connection limit, largest first.
+statement: |
+  SELECT d.datname AS database, pg_get_userbyid(d.datdba) AS owner,
+         pg_database_size(d.oid) AS bytes, pg_size_pretty(pg_database_size(d.oid)) AS size,
+         d.datconnlimit AS connection_limit
+  FROM pg_database d
+  WHERE d.datallowconn
+  ORDER BY bytes DESC
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_transaction_stats
+type: postgres-sql
+source: postgresql
+description: Per-database PostgreSQL counters since the last stats reset. Commits, rollbacks and rollback percent, cache hit percent, tuple activity, temp files, deadlocks and conflicts.
+statement: |
+  SELECT datname AS database, xact_commit AS commits, xact_rollback AS rollbacks,
+         round(100.0 * xact_rollback / NULLIF(xact_commit + xact_rollback, 0), 2) AS rollback_pct,
+         blks_read, blks_hit, round(100.0 * blks_hit / NULLIF(blks_hit + blks_read, 0), 2) AS cache_hit_pct,
+         tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted,
+         temp_files, temp_bytes, deadlocks, conflicts, stats_reset
+  FROM pg_stat_database
+  WHERE datname IS NOT NULL
+  ORDER BY xact_commit DESC
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_replication_status
+type: postgres-sql
+source: postgresql
+description: PostgreSQL replication role and health. replication_role is primary, standby or not_configured, and not_configured is a normal state. Returns connected replicas with lag, replication slots with retained WAL, and the WAL receiver and replay delay on a standby.
+statement: |
+  SELECT pg_is_in_recovery() AS in_recovery,
+         CASE WHEN pg_is_in_recovery() THEN 'standby'
+              WHEN EXISTS (SELECT 1 FROM pg_stat_replication) OR EXISTS (SELECT 1 FROM pg_replication_slots) THEN 'primary'
+              ELSE 'not_configured' END AS replication_role,
+         current_setting('wal_level') AS wal_level,
+         (SELECT json_agg(json_build_object('application_name', application_name, 'client_addr', host(client_addr),
+                                            'state', state, 'sync_state', sync_state, 'write_lag', write_lag,
+                                            'flush_lag', flush_lag, 'replay_lag', replay_lag))
+            FROM pg_stat_replication) AS replicas,
+         (SELECT json_agg(json_build_object('slot_name', slot_name, 'slot_type', slot_type, 'active', active,
+                                            'wal_status', wal_status,
+                                            'retained_bytes', CASE WHEN pg_is_in_recovery() THEN NULL
+                                                                   ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) END))
+            FROM pg_replication_slots) AS slots,
+         (SELECT json_build_object('status', status, 'last_msg_receipt_time', last_msg_receipt_time)
+            FROM pg_stat_wal_receiver) AS wal_receiver,
+         CASE WHEN pg_is_in_recovery() THEN extract(epoch FROM now() - pg_last_xact_replay_timestamp()) END AS replay_delay_seconds
+annotations: {readOnlyHint: true, idempotentHint: true}
+
+# =============================================================================
+# Phase 2 — MySQL schema, configuration and security
+# =============================================================================
+---
+kind: tool
+name: mysql_list_databases
+type: mysql-sql
+source: mysql
+description: List MySQL databases visible to the observer, with character set, collation, table count and whether each is a system schema.
+statement: |
+  SELECT s.SCHEMA_NAME AS database_name, s.DEFAULT_CHARACTER_SET_NAME AS charset, s.DEFAULT_COLLATION_NAME AS collation,
+         (SELECT COUNT(*) FROM information_schema.TABLES t WHERE t.TABLE_SCHEMA = s.SCHEMA_NAME) AS tables,
+         s.SCHEMA_NAME IN ('mysql', 'sys', 'performance_schema', 'information_schema') AS is_system
+  FROM information_schema.SCHEMATA s
+  ORDER BY is_system, database_name
+  LIMIT 500
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_list_tables
+type: mysql-sql
+source: mysql
+description: List tables and views in one MySQL database with engine, approximate rows, data/index/free bytes, collation, timestamps, and whether each has a primary key or any unique key. Use has_unique_key = 0 to find tables without one. Largest first.
+statement: |
+  SELECT t.TABLE_NAME AS table_name, t.TABLE_TYPE AS table_type, t.ENGINE AS engine, t.TABLE_ROWS AS approx_rows,
+         t.DATA_LENGTH AS data_bytes, t.INDEX_LENGTH AS index_bytes, t.DATA_FREE AS free_bytes,
+         t.TABLE_COLLATION AS collation, t.CREATE_TIME AS created, t.UPDATE_TIME AS updated,
+         EXISTS (SELECT 1 FROM information_schema.TABLE_CONSTRAINTS c WHERE c.TABLE_SCHEMA = t.TABLE_SCHEMA
+                 AND c.TABLE_NAME = t.TABLE_NAME AND c.CONSTRAINT_TYPE = 'PRIMARY KEY') AS has_primary_key,
+         EXISTS (SELECT 1 FROM information_schema.TABLE_CONSTRAINTS c WHERE c.TABLE_SCHEMA = t.TABLE_SCHEMA
+                 AND c.TABLE_NAME = t.TABLE_NAME AND c.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE')) AS has_unique_key
+  FROM information_schema.TABLES t
+  WHERE t.TABLE_SCHEMA = ?
+  ORDER BY COALESCE(t.DATA_LENGTH, 0) + COALESCE(t.INDEX_LENGTH, 0) DESC, t.TABLE_NAME
+  LIMIT ?
+parameters:
+  - {name: database, type: string, description: "Database (schema) name."}
+  - {name: limit, type: integer, description: "Max tables to return (1-500).", default: 100, minValue: 1, maxValue: 500}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_describe_table
+type: mysql-sql
+source: mysql
+description: Describe one MySQL table. Returns one row per column with type, nullability, default, key role, extra, collation, comment, and the constraints it takes part in, including foreign-key targets. Reads metadata only.
+statement: |
+  SELECT c.ORDINAL_POSITION AS position, c.COLUMN_NAME AS column_name, c.COLUMN_TYPE AS column_type,
+         c.IS_NULLABLE = 'YES' AS nullable, c.COLUMN_DEFAULT AS column_default, c.COLUMN_KEY AS column_key,
+         c.EXTRA AS extra, c.COLLATION_NAME AS collation,
+         (SELECT GROUP_CONCAT(CONCAT(k.CONSTRAINT_NAME,
+                   IF(k.REFERENCED_TABLE_NAME IS NULL, '',
+                      CONCAT(' -> ', k.REFERENCED_TABLE_SCHEMA, '.', k.REFERENCED_TABLE_NAME, '(', k.REFERENCED_COLUMN_NAME, ')')))
+                 ORDER BY k.CONSTRAINT_NAME SEPARATOR '; ')
+            FROM information_schema.KEY_COLUMN_USAGE k
+           WHERE k.TABLE_SCHEMA = c.TABLE_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME AND k.COLUMN_NAME = c.COLUMN_NAME) AS constraints,
+         c.COLUMN_COMMENT AS comment
+  FROM information_schema.COLUMNS c
+  WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
+  ORDER BY c.ORDINAL_POSITION
+parameters:
+  - {name: database, type: string, description: "Database (schema) name."}
+  - {name: table, type: string, description: "Table or view name."}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_list_indexes
+type: mysql-sql
+source: mysql
+description: List index definitions in one MySQL database, or one table in it, with uniqueness, type, visibility, ordered columns and cardinality estimate.
+statement: |
+  SELECT s.TABLE_NAME AS table_name, s.INDEX_NAME AS index_name, s.NON_UNIQUE = 0 AS is_unique,
+         s.INDEX_TYPE AS index_type, s.IS_VISIBLE AS visible,
+         GROUP_CONCAT(COALESCE(s.COLUMN_NAME, CONCAT('(', s.EXPRESSION, ')')) ORDER BY s.SEQ_IN_INDEX SEPARATOR ', ') AS columns,
+         MAX(s.CARDINALITY) AS cardinality
+  FROM information_schema.STATISTICS s
+  JOIN (SELECT ? AS db, ? AS tbl) p ON s.TABLE_SCHEMA = p.db AND (p.tbl = '' OR s.TABLE_NAME = p.tbl)
+  GROUP BY s.TABLE_NAME, s.INDEX_NAME, s.NON_UNIQUE, s.INDEX_TYPE, s.IS_VISIBLE
+  ORDER BY s.TABLE_NAME, s.INDEX_NAME
+  LIMIT ?
+parameters:
+  - {name: database, type: string, description: "Database (schema) name."}
+  - {name: table, type: string, description: "Optional table name; empty for every table in the database.", default: ""}
+  - {name: limit, type: integer, description: "Max indexes to return (1-500).", default: 200, minValue: 1, maxValue: 500}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_configuration
+type: mysql-sql
+source: mysql
+description: Allowlisted, non-sensitive MySQL server settings covering capacity, InnoDB durability, binary logging, slow log, timeouts, SQL mode, character set, TLS requirement and authentication policy. File paths and key material are excluded.
+statement: |
+  SELECT VARIABLE_NAME AS name, VARIABLE_VALUE AS value
+  FROM performance_schema.global_variables
+  WHERE VARIABLE_NAME IN ('version', 'max_connections', 'max_user_connections', 'innodb_buffer_pool_size',
+                          'innodb_redo_log_capacity', 'innodb_log_file_size', 'innodb_flush_log_at_trx_commit',
+                          'innodb_flush_method', 'innodb_file_per_table', 'innodb_io_capacity', 'sync_binlog', 'log_bin',
+                          'binlog_format', 'binlog_expire_logs_seconds', 'gtid_mode', 'server_id', 'slow_query_log',
+                          'long_query_time', 'log_queries_not_using_indexes', 'character_set_server', 'collation_server',
+                          'default_storage_engine', 'sql_mode', 'transaction_isolation', 'wait_timeout',
+                          'interactive_timeout', 'max_allowed_packet', 'table_open_cache', 'thread_cache_size',
+                          'tmp_table_size', 'max_heap_table_size', 'performance_schema', 'partial_revokes',
+                          'require_secure_transport', 'tls_version', 'authentication_policy',
+                          'default_authentication_plugin', 'local_infile', 'skip_name_resolve', 'bind_address', 'port',
+                          'read_only', 'super_read_only', 'time_zone', 'system_time_zone', 'lower_case_table_names',
+                          'information_schema_stats_expiry', 'max_execution_time', 'lock_wait_timeout',
+                          'innodb_lock_wait_timeout', 'event_scheduler')
+  ORDER BY VARIABLE_NAME
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_list_users
+type: mysql-sql
+source: mysql
+description: List MySQL accounts (user and host) with authentication plugin, lock and expiry state, password age and connection limits. Password hashes are never readable by this server (column-level grant).
+statement: |
+  SELECT u.User AS user, u.Host AS host, u.plugin AS auth_plugin, u.account_locked = 'Y' AS locked,
+         u.password_expired = 'Y' AS password_expired, u.password_last_changed,
+         u.max_connections, u.max_user_connections,
+         (u.User IN ('root', 'debian-sys-maint') OR u.User LIKE 'mysql.%') AS is_system
+  FROM mysql.user u
+  ORDER BY is_system, u.User, u.Host
+  LIMIT 500
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_user_grants
+type: mysql-sql
+source: mysql
+description: Effective grants of one MySQL account. Returns one row per privilege, with scope (global, global dynamic, database, table, role), the object, and whether it carries GRANT OPTION. Get exact user and host from mysql_list_users.
+statement: |
+  WITH p AS (SELECT ? AS usr, ? AS hst)
+  SELECT 'global' AS scope, '*.*' AS object, g.privilege, u.Grant_priv = 'Y' AS grantable
+  FROM mysql.user u JOIN p ON u.User = p.usr AND u.Host = p.hst
+  JOIN LATERAL (
+    SELECT 'SELECT' AS privilege, u.Select_priv AS granted UNION ALL SELECT 'INSERT', u.Insert_priv UNION ALL SELECT 'UPDATE', u.Update_priv
+    UNION ALL SELECT 'DELETE', u.Delete_priv UNION ALL SELECT 'CREATE', u.Create_priv UNION ALL SELECT 'DROP', u.Drop_priv
+    UNION ALL SELECT 'RELOAD', u.Reload_priv UNION ALL SELECT 'SHUTDOWN', u.Shutdown_priv UNION ALL SELECT 'PROCESS', u.Process_priv
+    UNION ALL SELECT 'FILE', u.File_priv UNION ALL SELECT 'GRANT OPTION', u.Grant_priv UNION ALL SELECT 'REFERENCES', u.References_priv
+    UNION ALL SELECT 'INDEX', u.Index_priv UNION ALL SELECT 'ALTER', u.Alter_priv UNION ALL SELECT 'SHOW DATABASES', u.Show_db_priv
+    UNION ALL SELECT 'SUPER', u.Super_priv UNION ALL SELECT 'CREATE TEMPORARY TABLES', u.Create_tmp_table_priv
+    UNION ALL SELECT 'LOCK TABLES', u.Lock_tables_priv UNION ALL SELECT 'EXECUTE', u.Execute_priv
+    UNION ALL SELECT 'REPLICATION SLAVE', u.Repl_slave_priv UNION ALL SELECT 'REPLICATION CLIENT', u.Repl_client_priv
+    UNION ALL SELECT 'CREATE VIEW', u.Create_view_priv UNION ALL SELECT 'SHOW VIEW', u.Show_view_priv
+    UNION ALL SELECT 'CREATE ROUTINE', u.Create_routine_priv UNION ALL SELECT 'ALTER ROUTINE', u.Alter_routine_priv
+    UNION ALL SELECT 'CREATE USER', u.Create_user_priv UNION ALL SELECT 'EVENT', u.Event_priv UNION ALL SELECT 'TRIGGER', u.Trigger_priv
+    UNION ALL SELECT 'CREATE TABLESPACE', u.Create_tablespace_priv UNION ALL SELECT 'CREATE ROLE', u.Create_role_priv
+    UNION ALL SELECT 'DROP ROLE', u.Drop_role_priv
+  ) g
+  WHERE g.granted = 'Y'
+  UNION ALL
+  SELECT 'global (dynamic)', '*.*', gg.PRIV, gg.WITH_GRANT_OPTION = 'Y'
+  FROM mysql.global_grants gg JOIN p ON gg.USER = p.usr AND gg.HOST = p.hst
+  UNION ALL
+  SELECT 'database', CONCAT(x.Db, '.*'), g.privilege, x.Grant_priv = 'Y'
+  FROM mysql.db x JOIN p ON x.User = p.usr AND x.Host = p.hst
+  JOIN LATERAL (
+    SELECT 'SELECT' AS privilege, x.Select_priv AS granted UNION ALL SELECT 'INSERT', x.Insert_priv UNION ALL SELECT 'UPDATE', x.Update_priv
+    UNION ALL SELECT 'DELETE', x.Delete_priv UNION ALL SELECT 'CREATE', x.Create_priv UNION ALL SELECT 'DROP', x.Drop_priv
+    UNION ALL SELECT 'GRANT OPTION', x.Grant_priv UNION ALL SELECT 'REFERENCES', x.References_priv UNION ALL SELECT 'INDEX', x.Index_priv
+    UNION ALL SELECT 'ALTER', x.Alter_priv UNION ALL SELECT 'CREATE TEMPORARY TABLES', x.Create_tmp_table_priv
+    UNION ALL SELECT 'LOCK TABLES', x.Lock_tables_priv UNION ALL SELECT 'CREATE VIEW', x.Create_view_priv
+    UNION ALL SELECT 'SHOW VIEW', x.Show_view_priv UNION ALL SELECT 'CREATE ROUTINE', x.Create_routine_priv
+    UNION ALL SELECT 'ALTER ROUTINE', x.Alter_routine_priv UNION ALL SELECT 'EXECUTE', x.Execute_priv
+    UNION ALL SELECT 'EVENT', x.Event_priv UNION ALL SELECT 'TRIGGER', x.Trigger_priv
+  ) g
+  WHERE g.granted = 'Y'
+  UNION ALL
+  SELECT 'table', CONCAT(t.Db, '.', t.Table_name), CAST(t.Table_priv AS CHAR), FIND_IN_SET('Grant', t.Table_priv) > 0
+  FROM mysql.tables_priv t JOIN p ON t.User = p.usr AND t.Host = p.hst
+  UNION ALL
+  SELECT 'role', CONCAT(r.FROM_USER, '@', r.FROM_HOST), 'ROLE', r.WITH_ADMIN_OPTION = 'Y'
+  FROM mysql.role_edges r JOIN p ON r.TO_USER = p.usr AND r.TO_HOST = p.hst
+parameters:
+  - {name: user, type: string, description: "Account user name, exactly as in mysql_list_users."}
+  - {name: host, type: string, description: "Account host, exactly as in mysql_list_users (e.g. 10.10.20.12 or %)."}
+annotations: {readOnlyHint: true, idempotentHint: true}
+
+# =============================================================================
+# Phase 2 — PostgreSQL cluster-wide inspection
+# (per-database catalog tools — schemas, tables, describe, indexes, role
+#  privileges — are adapter routes, further down)
+# =============================================================================
+---
+kind: tool
+name: pg_list_databases
+type: postgres-sql
+source: postgresql
+description: List PostgreSQL databases with owner, encoding, collation, connection limit, and whether connections and templates are allowed. Use pg_database_sizes for sizes.
+statement: |
+  SELECT d.datname AS database, pg_get_userbyid(d.datdba) AS owner, pg_encoding_to_char(d.encoding) AS encoding,
+         d.datcollate AS collation, d.datconnlimit AS connection_limit, d.datallowconn AS allow_connections,
+         d.datistemplate AS is_template
+  FROM pg_database d
+  ORDER BY d.datistemplate, d.datname
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_configuration
+type: postgres-sql
+source: postgresql
+description: Allowlisted, non-sensitive PostgreSQL settings covering memory, WAL, checkpoints, replication, autovacuum, logging, timeouts, TLS and planner. Returns value, unit, source and whether a restart is pending. Commands and paths are excluded.
+statement: |
+  SELECT name, setting, unit, source, context, pending_restart
+  FROM pg_settings
+  WHERE name = ANY (ARRAY['server_version', 'max_connections', 'superuser_reserved_connections', 'shared_buffers',
+                          'effective_cache_size', 'work_mem', 'maintenance_work_mem', 'wal_level', 'max_wal_size',
+                          'min_wal_size', 'checkpoint_timeout', 'checkpoint_completion_target', 'synchronous_commit',
+                          'full_page_writes', 'archive_mode', 'max_wal_senders', 'max_replication_slots', 'hot_standby',
+                          'autovacuum', 'autovacuum_max_workers', 'autovacuum_naptime', 'autovacuum_vacuum_scale_factor',
+                          'autovacuum_analyze_scale_factor', 'log_min_duration_statement', 'log_statement',
+                          'shared_preload_libraries', 'statement_timeout', 'idle_in_transaction_session_timeout',
+                          'lock_timeout', 'listen_addresses', 'port', 'ssl', 'ssl_min_protocol_version',
+                          'password_encryption', 'track_activities', 'track_counts', 'track_io_timing',
+                          'compute_query_id', 'random_page_cost', 'effective_io_concurrency', 'default_statistics_target',
+                          'max_worker_processes', 'max_parallel_workers', 'max_parallel_workers_per_gather', 'TimeZone',
+                          'server_encoding', 'data_checksums', 'huge_pages', 'jit', 'temp_file_limit',
+                          'max_locks_per_transaction'])
+  ORDER BY name
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_list_roles
+type: postgres-sql
+source: postgresql
+description: List PostgreSQL roles with login, superuser, createdb, createrole, replication and bypassrls attributes, connection limit, expiry and memberships. Built-in pg_* roles are hidden unless include_builtin is true. Passwords are never readable (pg_roles masks them).
+statement: |
+  SELECT r.rolname AS role, r.rolcanlogin AS can_login, r.rolsuper AS superuser, r.rolcreatedb AS create_db,
+         r.rolcreaterole AS create_role, r.rolreplication AS replication, r.rolbypassrls AS bypass_rls,
+         r.rolinherit AS inherit, r.rolconnlimit AS connection_limit, r.rolvaliduntil AS valid_until,
+         r.rolname LIKE 'pg\_%' AS is_builtin,
+         ARRAY(SELECT b.rolname FROM pg_auth_members m JOIN pg_roles b ON b.oid = m.roleid
+               WHERE m.member = r.oid ORDER BY 1) AS member_of
+  FROM pg_roles r
+  WHERE $1 OR r.rolname NOT LIKE 'pg\_%'
+  ORDER BY is_builtin, r.rolname
+parameters:
+  - {name: include_builtin, type: boolean, description: "Include built-in pg_* roles.", default: false}
+annotations: {readOnlyHint: true, idempotentHint: true}
+
+# =============================================================================
+# Phase 3 — MySQL diagnostics
+# Statement text is performance_schema DIGEST_TEXT (literals already replaced by
+# ?), truncated; raw processlist INFO is never returned.
+# =============================================================================
+---
+kind: tool
+name: mysql_active_sessions
+type: mysql-sql
+source: mysql
+description: Running MySQL sessions, and idle sessions holding an open transaction, longest first. Returns user, client host, database, command, seconds, state, normalised statement (literals replaced by ?), and transaction age, rows locked and rows modified.
+statement: |
+  SELECT t.PROCESSLIST_ID AS process_id, t.PROCESSLIST_USER AS user, t.PROCESSLIST_HOST AS client_host,
+         t.PROCESSLIST_DB AS database_name, t.PROCESSLIST_COMMAND AS command, t.PROCESSLIST_TIME AS seconds,
+         t.PROCESSLIST_STATE AS state, LEFT(s.DIGEST_TEXT, 300) AS statement_digest,
+         x.trx_started, TIMESTAMPDIFF(SECOND, x.trx_started, NOW()) AS trx_seconds, x.trx_state,
+         x.trx_rows_locked AS rows_locked, x.trx_rows_modified AS rows_modified
+  FROM performance_schema.threads t
+  JOIN (SELECT ? AS min_s) p
+  LEFT JOIN performance_schema.events_statements_current s ON s.THREAD_ID = t.THREAD_ID
+  LEFT JOIN information_schema.INNODB_TRX x ON x.trx_mysql_thread_id = t.PROCESSLIST_ID
+  WHERE t.TYPE = 'FOREGROUND' AND t.PROCESSLIST_ID IS NOT NULL AND t.PROCESSLIST_ID <> CONNECTION_ID()
+    AND t.PROCESSLIST_COMMAND NOT IN ('Daemon', 'Binlog Dump', 'Binlog Dump GTID')
+    AND (t.PROCESSLIST_COMMAND <> 'Sleep' OR x.trx_id IS NOT NULL)
+    AND COALESCE(t.PROCESSLIST_TIME, 0) >= p.min_s
+  ORDER BY t.PROCESSLIST_TIME DESC
+  LIMIT ?
+parameters:
+  - {name: min_duration_secs, type: integer, description: "Only sessions running at least this many seconds.", default: 0, minValue: 0, maxValue: 86400}
+  - {name: limit, type: integer, description: "Max sessions to return (1-100).", default: 25, minValue: 1, maxValue: 100}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_lock_waits
+type: mysql-sql
+source: mysql
+description: Current InnoDB row-lock waits, longest first. Returns the waiting and blocking process ids, the locked table and index, lock modes, transaction ages and rows locked. Pair a blocking_pid with mysql_active_sessions to see what it is doing.
+statement: |
+  SELECT w.wait_age_secs, w.locked_table, w.locked_index, w.locked_type,
+         w.waiting_pid, w.waiting_trx_age, w.waiting_trx_rows_locked, w.waiting_lock_mode,
+         w.blocking_pid, w.blocking_trx_age, w.blocking_trx_rows_locked, w.blocking_lock_mode
+  FROM sys.innodb_lock_waits w
+  ORDER BY w.wait_age_secs DESC
+  LIMIT ?
+parameters:
+  - {name: limit, type: integer, description: "Max waits to return (1-100).", default: 25, minValue: 1, maxValue: 100}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_slow_query_summary
+type: mysql-sql
+source: mysql
+description: Aggregated MySQL statement statistics from performance_schema digests (normalised text, no literal values). Returns executions, total/avg/max latency, rows examined vs sent, no-index and no-good-index counts, and disk temp tables. order_by is total_time (default), avg_time, executions, rows_examined or no_index.
+statement: |
+  SELECT d.SCHEMA_NAME AS database_name, LEFT(d.DIGEST_TEXT, 300) AS statement_digest, d.COUNT_STAR AS executions,
+         ROUND(d.SUM_TIMER_WAIT / 1e12, 3) AS total_seconds, ROUND(d.AVG_TIMER_WAIT / 1e9, 3) AS avg_ms,
+         ROUND(d.MAX_TIMER_WAIT / 1e9, 3) AS max_ms, d.SUM_ROWS_EXAMINED AS rows_examined, d.SUM_ROWS_SENT AS rows_sent,
+         d.SUM_ROWS_AFFECTED AS rows_affected, d.SUM_NO_INDEX_USED AS no_index_used,
+         d.SUM_NO_GOOD_INDEX_USED AS no_good_index_used, d.SUM_CREATED_TMP_DISK_TABLES AS tmp_disk_tables,
+         d.FIRST_SEEN AS first_seen, d.LAST_SEEN AS last_seen
+  FROM performance_schema.events_statements_summary_by_digest d
+  JOIN (SELECT ? AS db, ? AS ord) p ON (p.db = '' OR d.SCHEMA_NAME = p.db)
+  WHERE d.DIGEST_TEXT IS NOT NULL
+  ORDER BY CASE p.ord WHEN 'avg_time' THEN d.AVG_TIMER_WAIT WHEN 'executions' THEN d.COUNT_STAR
+                      WHEN 'rows_examined' THEN d.SUM_ROWS_EXAMINED WHEN 'no_index' THEN d.SUM_NO_INDEX_USED
+                      ELSE d.SUM_TIMER_WAIT END DESC
+  LIMIT ?
+parameters:
+  - {name: database, type: string, description: "Optional database filter; empty for all.", default: ""}
+  - name: order_by
+    type: string
+    description: "Sort key."
+    default: total_time
+    allowedValues: [total_time, avg_time, executions, rows_examined, no_index]
+  - {name: limit, type: integer, description: "Max statements to return (1-50).", default: 10, minValue: 1, maxValue: 50}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_table_io_stats
+type: mysql-sql
+source: mysql
+description: MySQL table I/O hotspots since server start. Returns reads, writes, fetches, inserts, updates and deletes, with read/write/total wait time per table, busiest first. System schemas are excluded.
+statement: |
+  SELECT t.OBJECT_SCHEMA AS database_name, t.OBJECT_NAME AS table_name,
+         t.COUNT_READ AS read_ops, t.COUNT_WRITE AS write_ops, t.COUNT_FETCH AS fetch_ops, t.COUNT_INSERT AS insert_ops,
+         t.COUNT_UPDATE AS update_ops, t.COUNT_DELETE AS delete_ops,
+         ROUND(t.SUM_TIMER_WAIT / 1e12, 3) AS total_wait_seconds, ROUND(t.SUM_TIMER_READ / 1e12, 3) AS read_wait_seconds,
+         ROUND(t.SUM_TIMER_WRITE / 1e12, 3) AS write_wait_seconds
+  FROM performance_schema.table_io_waits_summary_by_table t
+  JOIN (SELECT ? AS db) p ON (p.db = '' OR t.OBJECT_SCHEMA = p.db)
+  WHERE t.OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys', 'information_schema')
+  ORDER BY t.SUM_TIMER_WAIT DESC
+  LIMIT ?
+parameters:
+  - {name: database, type: string, description: "Optional database filter; empty for all.", default: ""}
+  - {name: limit, type: integer, description: "Max tables to return (1-100).", default: 25, minValue: 1, maxValue: 100}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_innodb_metrics
+type: mysql-sql
+source: mysql
+description: InnoDB health. Buffer pool size, pages (total, free, dirty) and read hit ratio, data reads and writes, redo written, row-lock waits and average wait, current lock waits, history list length (purge lag) and deadlocks.
+statement: |
+  SELECT @@innodb_buffer_pool_size AS buffer_pool_bytes,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_buffer_pool_pages_total' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS pages_total,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_buffer_pool_pages_free' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS pages_free,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_buffer_pool_pages_dirty' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS pages_dirty,
+         ROUND(100 * (1 - MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_buffer_pool_reads' THEN s.VARIABLE_VALUE END)
+                      / NULLIF(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_buffer_pool_read_requests' THEN s.VARIABLE_VALUE END), 0)), 3) AS read_hit_pct,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_data_reads' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS data_reads,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_data_writes' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS data_writes,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_os_log_written' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS redo_bytes_written,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_row_lock_waits' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS row_lock_waits,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_row_lock_time_avg' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS row_lock_wait_avg_ms,
+         CAST(MAX(CASE WHEN s.VARIABLE_NAME = 'Innodb_row_lock_current_waits' THEN s.VARIABLE_VALUE END) AS UNSIGNED) AS row_lock_current_waits,
+         (SELECT m.COUNT FROM information_schema.INNODB_METRICS m WHERE m.NAME = 'trx_rseg_history_len') AS history_list_length,
+         (SELECT m.COUNT FROM information_schema.INNODB_METRICS m WHERE m.NAME = 'lock_deadlocks') AS deadlocks
+  FROM performance_schema.global_status s
+  WHERE s.VARIABLE_NAME LIKE 'Innodb%'
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: mysql_table_fragmentation
+type: mysql-sql
+source: mysql
+description: MySQL tables with reclaimable free space, most first. Returns data, index and free bytes and the free-to-used percentage. Space can be reclaimed with OPTIMIZE TABLE, a manual DBA action this server does not perform.
+statement: |
+  SELECT t.TABLE_SCHEMA AS database_name, t.TABLE_NAME AS table_name, t.ENGINE AS engine,
+         t.DATA_LENGTH AS data_bytes, t.INDEX_LENGTH AS index_bytes, t.DATA_FREE AS free_bytes,
+         ROUND(100 * t.DATA_FREE / NULLIF(t.DATA_LENGTH + t.INDEX_LENGTH, 0), 1) AS fragmentation_pct
+  FROM information_schema.TABLES t
+  JOIN (SELECT ? AS db, ? AS minf) p ON (p.db = '' OR t.TABLE_SCHEMA = p.db)
+  WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys', 'information_schema')
+    AND t.TABLE_TYPE = 'BASE TABLE' AND t.DATA_FREE >= p.minf
+  ORDER BY t.DATA_FREE DESC
+  LIMIT ?
+parameters:
+  - {name: database, type: string, description: "Optional database filter; empty for all.", default: ""}
+  - {name: min_free_bytes, type: integer, description: "Only tables with at least this much free space.", default: 1048576, minValue: 0}
+  - {name: limit, type: integer, description: "Max tables to return (1-100).", default: 25, minValue: 1, maxValue: 100}
+annotations: {readOnlyHint: true, idempotentHint: true}
+
+# =============================================================================
+# Phase 3 — PostgreSQL diagnostics
+# Query text is normalised in SQL (quoted strings and numeric literals -> ?) and
+# truncated to 300 characters. Dollar-quoted bodies are not normalised, only
+# truncated.
+# =============================================================================
+---
+kind: tool
+name: pg_active_sessions
+type: postgres-sql
+source: postgresql
+description: Non-idle PostgreSQL client sessions (active, idle in transaction, waiting), oldest query first. Returns user, database, application, client address, state, wait event, query and transaction age, and normalised query text (literals replaced by ?).
+statement: |
+  SELECT a.pid, a.usename AS user, a.datname AS database, a.application_name, host(a.client_addr) AS client_addr,
+         a.state, a.wait_event_type, a.wait_event,
+         round(extract(epoch FROM now() - a.query_start)::numeric, 1) AS query_seconds,
+         round(extract(epoch FROM now() - a.xact_start)::numeric, 1) AS xact_seconds,
+         left(regexp_replace(regexp_replace(a.query, '''(?:[^'']|'''')*''', '?', 'g'), '\m[0-9]+(?:\.[0-9]+)?\M', '?', 'g'), 300) AS query_normalised
+  FROM pg_stat_activity a
+  WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid() AND a.state IS DISTINCT FROM 'idle'
+    AND coalesce(extract(epoch FROM now() - a.query_start), 0) >= $1
+  ORDER BY a.query_start NULLS LAST
+  LIMIT $2
+parameters:
+  - {name: min_duration_secs, type: integer, description: "Only sessions whose current query is at least this old.", default: 0, minValue: 0, maxValue: 86400}
+  - {name: limit, type: integer, description: "Max sessions to return (1-100).", default: 25, minValue: 1, maxValue: 100}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_blocking_sessions
+type: postgres-sql
+source: postgresql
+description: PostgreSQL lock-wait relationships. Each waiting session is paired with the session blocking it (pg_blocking_pids), with wait time, the blocker's state and transaction age, and normalised query text for both.
+statement: |
+  SELECT w.pid AS waiting_pid, w.usename AS waiting_user, w.datname AS database, w.wait_event_type, w.wait_event,
+         round(extract(epoch FROM now() - w.query_start)::numeric, 1) AS waiting_seconds,
+         left(regexp_replace(regexp_replace(w.query, '''(?:[^'']|'''')*''', '?', 'g'), '\m[0-9]+(?:\.[0-9]+)?\M', '?', 'g'), 300) AS waiting_query,
+         b.pid AS blocking_pid, b.usename AS blocking_user, b.state AS blocking_state,
+         round(extract(epoch FROM now() - b.xact_start)::numeric, 1) AS blocking_xact_seconds,
+         left(regexp_replace(regexp_replace(b.query, '''(?:[^'']|'''')*''', '?', 'g'), '\m[0-9]+(?:\.[0-9]+)?\M', '?', 'g'), 300) AS blocking_query
+  FROM pg_stat_activity w
+  CROSS JOIN LATERAL unnest(pg_blocking_pids(w.pid)) AS bp(pid)
+  JOIN pg_stat_activity b ON b.pid = bp.pid
+  WHERE w.wait_event_type = 'Lock'
+  ORDER BY waiting_seconds DESC NULLS LAST
+  LIMIT $1
+parameters:
+  - {name: limit, type: integer, description: "Max wait pairs to return (1-100).", default: 25, minValue: 1, maxValue: 100}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_long_transactions
+type: postgres-sql
+source: postgresql
+description: PostgreSQL transactions open longer than min_duration_secs (default 60), oldest first, including idle-in-transaction sessions that hold back vacuum. Returns state, age, whether it holds an xmin horizon, and normalised last query.
+statement: |
+  SELECT pid, usename AS user, datname AS database, application_name, host(client_addr) AS client_addr, state,
+         xact_start, round(extract(epoch FROM now() - xact_start)::numeric, 1) AS xact_seconds,
+         backend_xmin IS NOT NULL AS holds_xmin,
+         left(regexp_replace(regexp_replace(query, '''(?:[^'']|'''')*''', '?', 'g'), '\m[0-9]+(?:\.[0-9]+)?\M', '?', 'g'), 300) AS query_normalised
+  FROM pg_stat_activity
+  WHERE xact_start IS NOT NULL AND backend_type = 'client backend' AND pid <> pg_backend_pid()
+    AND extract(epoch FROM now() - xact_start) >= $1
+  ORDER BY xact_start
+  LIMIT $2
+parameters:
+  - {name: min_duration_secs, type: integer, description: "Minimum transaction age in seconds.", default: 60, minValue: 0, maxValue: 604800}
+  - {name: limit, type: integer, description: "Max transactions to return (1-100).", default: 25, minValue: 1, maxValue: 100}
+annotations: {readOnlyHint: true, idempotentHint: true}
+
+# =============================================================================
+# Adapter routes — PostgreSQL per-database catalog (Phase 2)
+# =============================================================================
+---
+kind: tool
+name: pg_list_schemas
+type: http
+source: adapter
+method: GET
+path: /v1/tools/pg_list_schemas
+description: List schemas in one PostgreSQL database with owner and table/view counts. The database must be on this server's catalog allowlist (see list_targets).
+queryParams:
+  - {name: database, type: string, description: "Database name (from list_targets catalog_databases)."}
+  - {name: limit, type: integer, description: "Max schemas (1-500).", default: 100, minValue: 1, maxValue: 500}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_list_tables
+type: http
+source: adapter
+method: GET
+path: /v1/tools/pg_list_tables
+description: List tables, partitioned tables, views, materialized views and foreign tables in one PostgreSQL database, optionally one schema. Returns kind, owner, approximate rows, total size and whether it has a primary key. Largest first.
+queryParams:
+  - {name: database, type: string, description: "Database name (from list_targets catalog_databases)."}
+  - {name: schema, type: string, description: "Optional schema; empty for all non-system schemas.", default: ""}
+  - {name: limit, type: integer, description: "Max relations (1-500).", default: 25, minValue: 1, maxValue: 500}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_describe_table
+type: http
+source: adapter
+method: GET
+path: /v1/tools/pg_describe_table
+description: Describe one PostgreSQL table or view. Returns columns (type, nullability, default, identity/generated, comment) and constraints (primary key, unique, foreign key with target, check). Reads the catalog only.
+queryParams:
+  - {name: database, type: string, description: "Database name (from list_targets catalog_databases)."}
+  - {name: schema, type: string, description: "Schema name, e.g. public."}
+  - {name: table, type: string, description: "Table or view name."}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_list_indexes
+type: http
+source: adapter
+method: GET
+path: /v1/tools/pg_list_indexes
+description: List index definitions in one PostgreSQL database, optionally filtered by schema and table. Returns uniqueness, primary/valid flags, size and scan count (zero scans = candidate for review). Largest first.
+queryParams:
+  - {name: database, type: string, description: "Database name (from list_targets catalog_databases)."}
+  - {name: schema, type: string, description: "Optional schema filter.", default: ""}
+  - {name: table, type: string, description: "Optional table filter.", default: ""}
+  - {name: limit, type: integer, description: "Max indexes (1-500).", default: 25, minValue: 1, maxValue: 500}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: pg_role_privileges
+type: http
+source: adapter
+method: GET
+path: /v1/tools/pg_role_privileges
+description: Effective privileges of one PostgreSQL role. Always returns attributes, memberships and CONNECT/CREATE/TEMP on every database. With database, also returns schema USAGE/CREATE and per-schema counts of relations the role can SELECT/INSERT/UPDATE/DELETE/TRUNCATE or owns.
+queryParams:
+  - {name: role, type: string, description: "Role name (from pg_list_roles)."}
+  - {name: database, type: string, description: "Optional database (from list_targets catalog_databases) for schema and object grants.", default: ""}
+annotations: {readOnlyHint: true, idempotentHint: true}
+
+# =============================================================================
+# Adapter routes — Redis (Phases 1-2)
+# Fixed commands, allowlisted fields. No key is read or enumerated.
+# =============================================================================
+---
+kind: tool
+name: redis_health
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_health
+description: Redis PING latency with the observer ACL user, plus role, version, mode and uptime.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_memory
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_memory
+description: Redis memory usage. Used, RSS and peak memory against maxmemory with utilization percent, eviction policy, fragmentation ratio and evicted key count.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_clients
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_clients
+description: Redis client counts. Connected, blocked, tracking and pub/sub clients against maxclients, rejected connections, and buffer-limit disconnections.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_keyspace_stats
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_keyspace_stats
+description: Redis keyspace counters. Hits, misses and hit ratio, expired and evicted keys, total keys and keys with expiry, ops per second. Key names are never read.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_persistence
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_persistence
+description: Redis persistence state. Last RDB save time and status, changes since the last save, AOF enabled/rewrite/write status, and loading state.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_replication_status
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_replication_status
+description: Redis replication role, connected replicas with offset and lag, and master link status on a replica. replication is not_configured for a standalone primary, which is a normal state.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_configuration
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_configuration
+description: Allowlisted, non-sensitive Redis settings covering memory limit and policy, maxclients, timeouts, lazyfree, slowlog and latency thresholds, protected mode and replica settings. Passwords are never returned.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_acl_users
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_acl_users
+description: Redis ACL user names with enabled state, nopass flag and password count. Password hashes are never returned.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_acl_permissions
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_acl_permissions
+description: Permissions of one Redis ACL user. Flags, allowed and denied commands, key patterns, channel patterns and selectors, with password hashes removed (count only).
+queryParams:
+  - {name: user, type: string, description: "ACL user name (from redis_acl_users)."}
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_keyspace_overview
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_keyspace_overview
+description: Per logical database Redis key counts, keys with expiry, expiring percent and average TTL. Taken from INFO keyspace; no key enumeration.
+annotations: {readOnlyHint: true, idempotentHint: true}
+---
+kind: tool
+name: redis_persistence_configuration
+type: http
+source: adapter
+method: GET
+path: /v1/tools/redis_persistence_configuration
+description: Redis persistence settings. RDB save schedule, appendonly and appendfsync, AOF rewrite thresholds, RDB compression and checksum, stop-writes-on-bgsave-error, and whether an ACL file is configured (path not returned).
+annotations: {readOnlyHint: true, idempotentHint: true}
+
+# =============================================================================
+# Toolsets — load a subset with /mcp/<toolset> if the full catalog is too large
+# for a client's context.
+# =============================================================================
+---
+kind: toolset
+name: monitoring
+tools: [list_targets, get_capabilities, tool_health, get_policy, get_audit_status,
+        mysql_health, mysql_connections, mysql_status, mysql_database_sizes, mysql_replication_status,
+        pg_health, pg_connections, pg_database_sizes, pg_transaction_stats, pg_replication_status,
+        redis_health, redis_memory, redis_clients, redis_keyspace_stats, redis_persistence, redis_replication_status]
+---
+kind: toolset
+name: inspection
+tools: [list_targets, mysql_list_databases, mysql_list_tables, mysql_describe_table, mysql_list_indexes,
+        mysql_configuration, mysql_list_users, mysql_user_grants,
+        pg_list_databases, pg_configuration, pg_list_roles, pg_list_schemas, pg_list_tables, pg_describe_table,
+        pg_list_indexes, pg_role_privileges,
+        redis_configuration, redis_acl_users, redis_acl_permissions, redis_keyspace_overview, redis_persistence_configuration]
+---
+kind: toolset
+name: diagnostics
+tools: [list_targets, mysql_active_sessions, mysql_lock_waits, mysql_slow_query_summary, mysql_table_io_stats,
+        mysql_innodb_metrics, mysql_table_fragmentation, pg_active_sessions, pg_blocking_sessions, pg_long_transactions]

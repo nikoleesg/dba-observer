@@ -1,0 +1,18 @@
+# dba-observer — Redis ACL user. Proposed; apply only after the operator approves.
+# Placeholder: <PASSWORD>.
+#
+# No key or channel access at all (resetkeys, resetchannels): no tool reads a
+# key. Commands are an explicit allowlist on top of -@all.
+#
+# CONFIG GET cannot be narrowed to parameter names by ACL, so the ACL allows
+# `CONFIG GET requirepass`. The adapter never issues it: its CONFIG GET names
+# are a fixed allowlist (src/dba_observer/redis_tools.py), and the tests seed a
+# password and check it never appears in any output.
+#
+# As a command (then persist: ACL SAVE with an aclfile, or CONFIG REWRITE when
+# users live in redis.conf; check which before applying):
+
+ACL SETUSER dba-observer reset on ><PASSWORD> resetkeys resetchannels -@all +ping +info +config|get +acl|users +acl|getuser
+
+# Equivalent aclfile / redis.conf line (password as its SHA-256, # prefix):
+# user dba-observer on #<SHA256_OF_PASSWORD> resetchannels -@all +ping +info +config|get +acl|users +acl|getuser

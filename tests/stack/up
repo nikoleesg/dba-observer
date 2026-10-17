@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Build both images, start the disposable test stack, seed it and apply the
+# grants from ../../grants exactly as written (placeholders substituted).
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+ROOT="$(cd ../.. && pwd)"
+
+OBS_MYSQL_PASS="obs-mysql-$(openssl rand -hex 8)"
+OBS_PG_PASS="obs-pg-$(openssl rand -hex 8)"
+OBS_REDIS_PASS="obs-redis-$(openssl rand -hex 8)"
+
+dc() { docker compose -f compose.yaml "$@"; }
+
+echo "--- building images"
+docker build -q --target toolbox -t dba-observer-toolbox:test "$ROOT" >/dev/null
+docker build -q --target adapter -t dba-observer-adapter:test "$ROOT" >/dev/null
+
+echo "--- starting databases"
+dc up -d --wait mysql postgres redis
+
+echo "--- seeding and granting"
+dc exec -T mysql mysql -uroot -proot-test-only < seed-mysql.sql 2>/dev/null
+sed -e "s/<DOCKER_VM_IP>/%/g" -e "s/<PASSWORD>/$OBS_MYSQL_PASS/g" -e "s/<APP_SCHEMA>/app_one/g" "$ROOT/grants/mysql.sql" \
+  | dc exec -T mysql mysql -uroot -proot-test-only 2>/dev/null
+dc exec -T postgres psql -q -v ON_ERROR_STOP=1 -U postgres < seed-postgres.sql >/dev/null
+sed -e "s/<PASSWORD>/$OBS_PG_PASS/g" -e "s/<CATALOG_DB>/app_pg/g" "$ROOT/grants/postgresql.sql" \
+  | dc exec -T postgres psql -q -v ON_ERROR_STOP=1 -U postgres >/dev/null
+dc exec -T redis redis-cli -a SEKRIT-REDIS-DEFAULT-PASS --no-auth-warning < seed-redis.txt >/dev/null
+grep '^ACL SETUSER' "$ROOT/grants/redis-acl.txt" | sed "s/<PASSWORD>/$OBS_REDIS_PASS/" \
+  | dc exec -T redis redis-cli -a SEKRIT-REDIS-DEFAULT-PASS --no-auth-warning >/dev/null
+
+echo "--- writing secret files"
+mkdir -p .secrets && chmod 0755 .secrets
+cat > .secrets/toolbox.env <<ENV
+MYSQL_HOST=mysql
+MYSQL_USER=dba_observer
+MYSQL_PASSWORD=$OBS_MYSQL_PASS
+MYSQL_TLS=preferred
+PG_HOST=postgres
+PG_USER=dba_observer
+PG_PASSWORD=$OBS_PG_PASS
+PG_HOME_DATABASE=dba_observer
+PG_SSLMODE=require
+ADAPTER_URL=http://dba-observer-adapter:8080
+ADAPTER_CIDR=172.30.99.0/29
+ENV
+cat > .secrets/adapter.env <<ENV
+REDIS_HOST=redis
+REDIS_USERNAME=dba-observer
+REDIS_PASSWORD=$OBS_REDIS_PASS
+PG_HOST=postgres
+PG_USER=dba_observer
+PG_PASSWORD=$OBS_PG_PASS
+PG_HOME_DATABASE=dba_observer
+PG_SSLMODE=require
+PG_DATABASES=app_pg
+MYSQL_HOST=mysql
+ENV
+# Test-only: world-readable so the non-root container users can read them.
+chmod 0644 .secrets/*.env
+
+echo "--- starting dba-observer"
+dc --profile app up -d --wait dba-observer-adapter dba-observer
+echo "ready: http://127.0.0.1:15000/mcp"

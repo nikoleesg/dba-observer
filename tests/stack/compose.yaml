@@ -1,0 +1,65 @@
+# Disposable test stack: the two dba-observer images against throwaway MySQL,
+# PostgreSQL and Redis seeded with planted secrets. Driven by ./up and ./down;
+# never used for deployment. Engine versions follow Ubuntu 24.04's packages.
+name: dba-observer-test
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root-test-only
+    networks: [dbs]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot-test-only"]
+      interval: 2s
+      retries: 60
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: root-test-only
+    # TLS with the image's snakeoil cert, like the db VM; clients use sslmode=require.
+    command: ["postgres", "-c", "ssl=on", "-c", "ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem",
+              "-c", "ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key"]
+    networks: [dbs]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 60
+
+  redis:
+    image: redis:7.0
+    command: ["redis-server", "--requirepass", "SEKRIT-REDIS-DEFAULT-PASS"]
+    networks: [dbs]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "SEKRIT-REDIS-DEFAULT-PASS", "--no-auth-warning", "ping"]
+      interval: 2s
+      retries: 60
+
+  dba-observer-adapter:
+    image: dba-observer-adapter:test
+    networks: [dba-observer, dbs]
+    volumes:
+      - ./.secrets/adapter.env:/run/secrets/dba-observer-adapter.env:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    profiles: [app]
+
+  dba-observer:
+    image: dba-observer-toolbox:test
+    networks: [dba-observer, dbs]
+    ports: ["127.0.0.1:15000:5000"]
+    volumes:
+      - ./.secrets/toolbox.env:/run/secrets/dba-observer-toolbox.env:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    profiles: [app]
+
+networks:
+  dbs: {}
+  dba-observer:
+    ipam:
+      config:
+        - subnet: 172.30.99.0/29

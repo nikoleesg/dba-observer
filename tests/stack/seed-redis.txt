@@ -1,0 +1,3 @@
+ACL SETUSER app on >SEKRIT-REDIS-APP-PASS ~app:* +@read +@write
+SET app:secret SEKRIT-REDIS-VALUE
+SET app:temp x EX 3600
