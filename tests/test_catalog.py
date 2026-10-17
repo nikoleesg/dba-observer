@@ -1,6 +1,8 @@
 """The tool surface is a contract: catalog.yaml, tools.yaml and the adapter routes must agree."""
 
+import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -11,6 +13,7 @@ from dba_observer.server import ROUTES
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS_YAML = ROOT / "docker" / "tools.yaml"
 CHECK = ROOT / "docker" / "check-tools-yaml.sh"
+LOCK = ROOT / "docker" / "requirements.lock"
 
 
 def docs():
@@ -100,3 +103,25 @@ def test_check_script_rejects_template_parameters(tmp_path):
     bad.write_text(TOOLS_YAML.read_text() + "\n---\nkind: tool\nname: x\ntype: mysql-sql\nsource: mysql\ndescription: x\nstatement: SELECT 1\ntemplateParameters: []\n")
     r = subprocess.run(["bash", str(CHECK), str(bad)], capture_output=True, text=True)
     assert r.returncode != 0
+
+
+def _norm(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def test_lock_file_covers_and_satisfies_pyproject():
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+
+    pinned = {}
+    for line in LOCK.read_text().splitlines():
+        if m := re.match(r"^([A-Za-z0-9._-]+)==([^\s;\\]+)", line):
+            pinned[_norm(m[1])] = Version(m[2])
+    assert "--hash=sha256:" in LOCK.read_text()
+    deps = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
+    for dep in map(Requirement, deps):
+        name = _norm(dep.name)
+        assert name in pinned, f"{dep.name} missing from {LOCK.name}: regenerate it"
+        assert pinned[name] in dep.specifier, f"{dep.name}=={pinned[name]} violates {dep.specifier}"
+        for extra in dep.extras:  # psycopg[binary] -> psycopg-binary
+            assert _norm(f"{dep.name}-{extra}") in pinned

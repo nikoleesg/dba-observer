@@ -32,10 +32,15 @@ check-tools-yaml "$CONFIG"
 # --allowed-hosts: DNS-rebinding guard; set to the public hostname in deployment.
 #   `localhost` is always added when a list is set: the image HEALTHCHECK sends
 #   `Host: localhost` from inside the container, and is refused (403) otherwise.
+# --allowed-origins: CORS. Only this origin gets Access-Control-Allow-Origin, so
+#   a browser page elsewhere cannot call the server; requests are not refused.
+#   Set to the public origin in deployment (the default `*` logs a startup WARN).
+#   MCP clients send no Origin header and are unaffected.
 ALLOWED_HOSTS="${TOOLBOX_ALLOWED_HOSTS:-*}"
 if [ "$ALLOWED_HOSTS" != "*" ]; then
   ALLOWED_HOSTS="$ALLOWED_HOSTS,localhost"
 fi
 exec toolbox --config "$CONFIG" --disable-reload -a 0.0.0.0 -p 5000 \
   --logging-format JSON --log-level "${TOOLBOX_LOG_LEVEL:-DEBUG}" \
-  --allowed-hosts "$ALLOWED_HOSTS"
+  --allowed-hosts "$ALLOWED_HOSTS" \
+  --allowed-origins "${TOOLBOX_ALLOWED_ORIGINS:-*}"

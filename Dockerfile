@@ -35,17 +35,28 @@ ENTRYPOINT ["/usr/local/bin/entrypoint"]
 # -----------------------------------------------------------------------------
 # Adapter: Redis tools, PostgreSQL per-database catalog tools, meta tools.
 # Reachable only from the Toolbox container, on an internal network.
+# Every third-party package, build backend included, comes from a hash-pinned
+# lock file, so rebuilding a tag reproduces the dependencies the tests ran on.
 # -----------------------------------------------------------------------------
-FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS adapter
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS adapter-wheel
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /src
+COPY docker/build-requirements.lock ./
+RUN pip install --require-hashes -r build-requirements.lock
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install . && rm -rf /src \
+RUN pip wheel --no-deps --no-build-isolation -w /wheels .
+
+FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS adapter
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+COPY docker/requirements.lock /tmp/requirements.lock
+COPY --from=adapter-wheel /wheels /tmp/wheels
+RUN pip install --require-hashes -r /tmp/requirements.lock \
+ && pip install --no-deps /tmp/wheels/*.whl \
+ && rm -rf /tmp/requirements.lock /tmp/wheels \
  && groupadd -g 1608 dbaobs && useradd -u 1608 -g 1608 -M -s /usr/sbin/nologin dbaobs
 COPY docker/adapter-entrypoint.sh /usr/local/bin/entrypoint
 RUN chmod 0755 /usr/local/bin/entrypoint
-WORKDIR /
 USER 1608:1608
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

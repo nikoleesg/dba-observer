@@ -9,7 +9,7 @@ It covers Phases 0–3 (foundation, monitoring, inspection, diagnostics) of the 
 requirements. Phase 4, approval-gated administration, is a separate server, `dba-admin`, with its
 own credentials. This one has no mutating tool at all.
 
-- **Version:** 0.1.1 · **Transport:** streamable HTTP (`:5000/mcp`) · **Language:** Python adapter + YAML-configured Toolbox
+- **Version:** 0.1.2 · **Transport:** streamable HTTP (`:5000/mcp`) · **Language:** Python adapter + YAML-configured Toolbox
 - **Built on:** [Google MCP Toolbox for Databases](https://github.com/googleapis/mcp-toolbox)
   v1.14.0 (Apache 2.0), digest-pinned
 
@@ -114,7 +114,8 @@ The tool set is the first boundary, and the grants are the backstop. Both are te
   - The public route is behind Cloudflare Access.
   - LAN callers are not authenticated. This is an owner decision for the read-only tier;
     `dba-admin` must authenticate.
-  - `--allowed-hosts` should be set to the public hostname (`TOOLBOX_ALLOWED_HOSTS`).
+  - `--allowed-hosts` should be set to the public hostname (`TOOLBOX_ALLOWED_HOSTS`), and
+    `--allowed-origins` to the public origin (`TOOLBOX_ALLOWED_ORIGINS`).
 
 ## Database accounts
 
@@ -142,6 +143,7 @@ Each container reads one mounted secret file. Never compose `environment:`.
 | `ADAPTER_URL` | `http://dba-observer-adapter:8080` (default) |
 | `ADAPTER_CIDR` | Subnet of the private network shared with the adapter. Toolbox's SSRF guard blocks private addresses unless allowed (default `172.30.99.0/29`) |
 | `TOOLBOX_ALLOWED_HOSTS` | DNS-rebinding guard, e.g. `dba-observer.mcp-server.cc.cd` (default `*`). `localhost` is always added, for the image healthcheck. A probe that reaches the container by IP must send an allowed `Host` header (`MCP_HOST=` for `tests/mcp_client.py`) |
+| `TOOLBOX_ALLOWED_ORIGINS` | CORS origin, e.g. `https://dba-observer.mcp-server.cc.cd` (default `*`, which logs a startup WARN). Only this origin gets `Access-Control-Allow-Origin`, so a browser page elsewhere cannot call the server. Requests are not refused, and MCP clients, which send no `Origin`, are unaffected |
 | `TOOLBOX_LOG_LEVEL` | `DEBUG` (default; the audit trail) |
 
 **`dba-observer-adapter`** (`/run/secrets/dba-observer-adapter.env`, readable by uid 1608):
@@ -176,8 +178,8 @@ The integration suite proves:
 Images (build from the `v<version>` tag only; the version lives in `pyproject.toml`):
 
 ```bash
-docker build --target toolbox -t dba-observer-toolbox:0.1.1 .
-docker build --target adapter -t dba-observer-adapter:0.1.1 .
+docker build --target toolbox -t dba-observer-toolbox:0.1.2 .
+docker build --target adapter -t dba-observer-adapter:0.1.2 .
 ```
 
 Probe a deployment: `python tests/mcp_client.py http://<host>:5000/mcp list`.
@@ -220,6 +222,11 @@ A correct connection lists **50 tools**, and none of them executes SQL.
 **Bumping Toolbox.** Check the [releases](https://github.com/googleapis/mcp-toolbox/releases).
 Re-pin the `FROM` digest (multi-arch index) in `Dockerfile`, then run the full suite against the
 stack. Re-verify that DEBUG logging still omits SQL and rows; the audit claim depends on it.
+
+**Adapter dependencies.** The image installs `docker/requirements.lock` (and the build backend
+from `docker/build-requirements.lock`) with `--require-hashes`. After changing a dependency in
+`pyproject.toml`, regenerate the lock with the command in its header; `tests/test_catalog.py`
+fails while the two disagree.
 
 **Changing the tool surface.** Edit `catalog.yaml`, `docker/tools.yaml` and, for adapter tools,
 `server.py` together; `tests/test_catalog.py` fails until they agree. A new or renamed tool is

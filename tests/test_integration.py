@@ -146,6 +146,22 @@ def test_dns_rebinding_guard_and_healthcheck(mcp):
     assert health == "healthy"
 
 
+def test_cors_allows_only_the_configured_origin(mcp):
+    # --allowed-origins is a CORS policy, not a request filter: a browser page on
+    # a foreign origin gets no Access-Control-Allow-Origin, so the browser blocks
+    # the JSON POST at its preflight. MCP clients send no Origin and are unaffected
+    # (the `mcp` fixture). TOOLBOX_ALLOWED_ORIGINS in tests/stack/up.
+    def preflight(origin):
+        return httpx.options(URL, headers={"Host": HOST, "Origin": origin,
+                                           "Access-Control-Request-Method": "POST",
+                                           "Access-Control-Request-Headers": "content-type"})
+    assert "access-control-allow-origin" not in preflight("https://evil.example").headers
+    allowed = f"https://{HOST}"
+    assert preflight(allowed).headers.get("access-control-allow-origin") == allowed
+    assert "access-control-allow-origin" not in httpx.post(
+        URL, json={}, headers={"Host": HOST, "Origin": "https://evil.example"}).headers
+
+
 def test_surface_is_exactly_the_catalog(mcp):
     names = {t["name"] for t in mcp.list_tools()}
     assert names == {t["name"] for t in catalog()["tools"]}
