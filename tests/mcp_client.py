@@ -2,6 +2,7 @@
 
     python tests/mcp_client.py http://127.0.0.1:15000/mcp list
     python tests/mcp_client.py http://127.0.0.1:15000/mcp call mysql_health '{}'
+    MCP_HOST=dba-observer.mcp-server.cc.cd python tests/mcp_client.py http://<container-ip>:5000/mcp list
 """
 
 from __future__ import annotations
@@ -14,11 +15,13 @@ import httpx
 
 
 class MCP:
-    def __init__(self, url: str, timeout: float = 30):
+    def __init__(self, url: str, timeout: float = 30, host: str | None = None):
         self.url = url
         self.http = httpx.Client(timeout=timeout)
         self.ids = itertools.count(1)
         self.headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+        if host:  # when Toolbox runs with --allowed-hosts and is reached by IP
+            self.headers["Host"] = host
         init = self._rpc("initialize", {
             "protocolVersion": "2025-06-18", "capabilities": {},
             "clientInfo": {"name": "dba-observer-tests", "version": "0"},
@@ -74,8 +77,9 @@ class MCP:
 
 
 if __name__ == "__main__":
+    import os
     url, cmd = sys.argv[1], sys.argv[2]
-    m = MCP(url)
+    m = MCP(url, host=os.environ.get("MCP_HOST"))
     if cmd == "list":
         for t in m.list_tools():
             print(t["name"])

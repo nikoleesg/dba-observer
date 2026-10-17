@@ -1,6 +1,6 @@
 [project]
 name = "dba-observer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Read-only DBA observer MCP server for MySQL, PostgreSQL and Redis: Google MCP Toolbox plus a narrow adapter for Redis, per-database PostgreSQL catalog and meta tools."
 readme = "README.md"
 requires-python = ">=3.12"

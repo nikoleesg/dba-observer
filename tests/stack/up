@@ -43,6 +43,7 @@ PG_HOME_DATABASE=dba_observer
 PG_SSLMODE=require
 ADAPTER_URL=http://dba-observer-adapter:8080
 ADAPTER_CIDR=172.30.99.0/29
+TOOLBOX_ALLOWED_HOSTS=dba-observer.test
 ENV
 cat > .secrets/adapter.env <<ENV
 REDIS_HOST=redis

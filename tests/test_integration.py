@@ -28,6 +28,7 @@ pytestmark = pytest.mark.integration
 
 STACK = Path(__file__).parent / "stack"
 URL = os.environ.get("DBA_OBSERVER_URL", "http://127.0.0.1:15000/mcp")
+HOST = os.environ.get("DBA_OBSERVER_HOST", "dba-observer.test")  # TOOLBOX_ALLOWED_HOSTS in tests/stack/up
 
 DEFAULT_ARGS = {
     "mysql_list_tables": {"database": "app_one"},
@@ -89,10 +90,10 @@ def snapshot() -> dict:
 @pytest.fixture(scope="module")
 def mcp() -> MCP:
     try:
-        httpx.get(URL.rsplit("/mcp", 1)[0] + "/", timeout=2)
+        httpx.get(URL.rsplit("/mcp", 1)[0] + "/", timeout=2, headers={"Host": HOST})
     except httpx.HTTPError:
         pytest.skip("test stack not running: tests/stack/up")
-    return MCP(URL)
+    return MCP(URL, host=HOST)
 
 
 @pytest.fixture(scope="module")
@@ -135,6 +136,15 @@ def live_sessions():
 
 
 # --------------------------------------------------------------------------- surface
+
+def test_dns_rebinding_guard_and_healthcheck(mcp):
+    base = URL.rsplit("/mcp", 1)[0] + "/"
+    assert httpx.get(base, headers={"Host": "evil.example"}).status_code == 403
+    assert httpx.get(base, headers={"Host": HOST}).status_code == 200
+    health = subprocess.run(["docker", "inspect", "--format", "{{.State.Health.Status}}",
+                             "dba-observer-test-dba-observer-1"], capture_output=True, text=True).stdout.strip()
+    assert health == "healthy"
+
 
 def test_surface_is_exactly_the_catalog(mcp):
     names = {t["name"] for t in mcp.list_tools()}
